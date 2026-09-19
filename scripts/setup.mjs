@@ -10,6 +10,10 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { loadLocalEnv } from '../bridge/env.mjs';
+import { isElevenLabsKey } from '../bridge/elevenlabs-key.mjs';
+
+const localEnvKeys = new Set(loadLocalEnv());
 
 const tick = '  ok  ';
 const warn = ' note ';
@@ -35,22 +39,20 @@ try {
   line(warn, 'Could not read the Node.js version. JARVIS needs Node 20 or newer.');
 }
 
-// --- Claude CLI on PATH ---------------------------------------------------
-let claudeFound = false;
+// --- Codex CLI on PATH ----------------------------------------------------
+let codexFound = false;
 try {
-  const res = spawnSync('claude', ['--version'], { encoding: 'utf8', timeout: 10000 });
+  const res = spawnSync('codex', ['--version'], { encoding: 'utf8', timeout: 10000, shell: process.platform === 'win32' });
   if (res.status === 0 && res.stdout) {
-    claudeFound = true;
-    line(tick, `Claude CLI found: ${res.stdout.trim()}`);
+    codexFound = true;
+    line(tick, `Codex CLI found: ${res.stdout.trim()}`);
   }
 } catch {
   // ignore — handled below
 }
-if (!claudeFound) {
-  line(warn, 'Claude CLI not found on your PATH.');
-  line(info, 'Install it: npm install -g @anthropic-ai/claude-code');
-  line(info, '  (or the platform installer at https://docs.claude.com/en/docs/claude-code)');
-  line(info, 'Then run `claude` once and complete login. The bridge uses that login — no API key needed.');
+if (!codexFound) {
+  line(warn, 'Codex CLI not found on your PATH.');
+  line(info, 'Install Codex, then run `codex login` with your ChatGPT account.');
 }
 
 // --- ~/.claude.json and MCP servers --------------------------------------
@@ -77,8 +79,10 @@ try {
 
 // --- ElevenLabs key (env or the elevenlabs MCP entry) --------------------
 function findElevenLabsKey() {
-  if (process.env.ELEVENLABS_API_KEY && process.env.ELEVENLABS_API_KEY.trim()) {
-    return 'environment (ELEVENLABS_API_KEY)';
+  if (isElevenLabsKey(process.env.ELEVENLABS_API_KEY)) {
+    return localEnvKeys.has('ELEVENLABS_API_KEY')
+      ? '.env.local'
+      : 'environment (ELEVENLABS_API_KEY)';
   }
   try {
     const raw = readFileSync(claudeJsonPath, 'utf8');
@@ -86,7 +90,7 @@ function findElevenLabsKey() {
     const servers = parsed && parsed.mcpServers ? parsed.mcpServers : {};
     const el = servers.elevenlabs;
     const env = el && el.env ? el.env : {};
-    if (env.ELEVENLABS_API_KEY && String(env.ELEVENLABS_API_KEY).trim()) {
+    if (isElevenLabsKey(env.ELEVENLABS_API_KEY)) {
       return 'the elevenlabs MCP server in ~/.claude.json';
     }
   } catch {
@@ -99,14 +103,19 @@ const elSource = findElevenLabsKey();
 if (elSource) {
   line(tick, `Premium voice available — ElevenLabs key found via ${elSource}.`);
 } else {
-  line(info, 'No ElevenLabs key found — JARVIS will use browser speech (that is completely fine).');
-  line(info, '  Optional: add ELEVENLABS_API_KEY for a better voice and Scribe transcription. The free tier is enough for a demo.');
+  if (process.env.ELEVENLABS_API_KEY?.trim()) {
+    line(warn, 'The ElevenLabs value in .env.local is a key ID, not a secret API key.');
+    line(info, '  Create or rotate a key and copy the value that begins with sk_.');
+  }
+  line(info, 'No ElevenLabs key found — JARVIS will use local Kokoro output and browser recognition.');
+  line(info, '  Create a free key at https://elevenlabs.io/app/developers/api-keys');
+  line(info, '  Then put ELEVENLABS_API_KEY=your_key in .env.local and restart JARVIS.');
 }
 
 // --- How to run ----------------------------------------------------------
 console.log('');
 console.log('To run JARVIS, open two terminals:');
-console.log('  1)  npm run bridge      # the brain (Claude Code, headless)');
+console.log('  1)  npm run bridge      # the brain (Codex with ChatGPT sign-in)');
 console.log('  2)  npm run dev         # the face (open http://localhost:5173 in Chrome)');
 console.log('');
 console.log('Then click INITIALISE and say "Hey Jarvis".');

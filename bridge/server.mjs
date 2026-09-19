@@ -26,9 +26,20 @@ import { readFileSync, realpathSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
-import { probeUrl, renderPage } from './page.mjs'
+import { renderPage } from './page.mjs'
+import { billingError } from './billing-result.mjs'
+import { localAnswer } from './local-answer.mjs'
+import { serveCodexSocket } from './codex.mjs'
+import { loadLocalEnv } from './env.mjs'
+import { isElevenLabsKey } from './elevenlabs-key.mjs'
+
+// Vite already reads this file for browser settings. Load its non-VITE values
+// here as well so the ElevenLabs secret stays local and `npm start` needs no
+// special shell syntax on Windows.
+loadLocalEnv()
 
 const PORT = Number(process.env.JARVIS_BRIDGE_PORT ?? 8787)
+const BRAIN = process.env.JARVIS_BRAIN ?? 'codex'
 
 /**
  * A crash here takes the whole assistant down mid-sentence, and most of what
@@ -252,7 +263,23 @@ const VETO_EXEMPT = new Set([
   'openrouter__send-feedback',
 ])
 
-function decideTool(name) {
+// These installed tools do not start with a read verb. Keep exceptions scoped
+// to exact tools; desktop actions, navigation, and scripts need action mode.
+const LOCAL_READ_TOOLS = new Set([
+  'jarvis-playwright__browser_snapshot',
+  'jarvis-playwright__browser_find',
+  'jarvis-playwright__browser_console_messages',
+  'jarvis-playwright__browser_network_requests',
+  'jarvis-playwright__browser_network_request',
+  'jarvis-playwright__browser_wait_for',
+  'jarvis-windows__Snapshot',
+  'jarvis-windows__Screenshot',
+  'jarvis-windows__DisplayInventory',
+  'jarvis-windows__Wait',
+  'jarvis-windows__WaitFor',
+])
+
+function decideTool(name, input = {}) {
   if (READ_ONLY_BUILTINS.has(name)) return true
   if (WRITE_BUILTINS.has(name)) return ALLOW_WRITES
 
@@ -280,6 +307,15 @@ function decideTool(name) {
     if (server === 'jarvis_eyes') return true
 
     const tool = mcpToolOf(name)
+    if (LOCAL_READ_TOOLS.has(`${server}__${tool}`)) {
+      // Playwright inspection can optionally save output to a caller-selected
+      // file. Binary response bodies also write an artifact without a filename.
+      if (server === 'jarvis-playwright' && (
+        input?.filename !== undefined ||
+        (tool === 'browser_network_request' && input?.part === 'response-body')
+      )) return ALLOW_WRITES
+      return true
+    }
     if (EFFECTFUL_VERB.test(tool) && !VETO_EXEMPT.has(`${server}__${tool}`)) {
       return ALLOW_WRITES
     }
@@ -446,12 +482,14 @@ Using tools:
  * never sees it: it POSTs text to /tts here and gets audio back.
  */
 function elevenKey() {
-  if (process.env.ELEVENLABS_API_KEY) return process.env.ELEVENLABS_API_KEY
+  const local = process.env.ELEVENLABS_API_KEY?.trim()
+  if (isElevenLabsKey(local)) return local
   try {
     const cfg = JSON.parse(
       readFileSync(join(homedir(), '.claude.json'), 'utf8'),
     )
-    return cfg.mcpServers?.elevenlabs?.env?.ELEVENLABS_API_KEY ?? null
+    const configured = cfg.mcpServers?.elevenlabs?.env?.ELEVENLABS_API_KEY
+    return isElevenLabsKey(configured) ? configured.trim() : null
   } catch {
     return null
   }
@@ -1002,9 +1040,11 @@ server.listen(PORT)
 
 console.log(`[jarvis] bridge listening on ws://localhost:${PORT}`)
 console.log(
-  `[jarvis] speech ${elevenKey() ? 'via ElevenLabs (key from MCP config)' : 'using browser fallback voice'}`,
+  `[jarvis] speech ${elevenKey() ? 'via ElevenLabs' : 'API not configured — using the local/browser fallback'}`,
 )
-console.log(`[jarvis] model ${MODEL} · effort ${EFFORT}`)
+console.log(BRAIN === 'codex'
+  ? '[jarvis] brain Codex via ChatGPT sign-in'
+  : `[jarvis] model ${MODEL} · effort ${EFFORT}`)
 console.log(
   `[jarvis] writes ${ALLOW_WRITES ? 'ENABLED' : 'disabled'}` +
     (ALLOW_WRITES ? '' : ' — set JARVIS_ALLOW_WRITES=1 to permit shell/file/device actions'),
@@ -1041,6 +1081,11 @@ const RESULT_FAILURES = {
 
 wss.on('connection', (socket) => {
   console.log('[jarvis] client connected')
+
+  if (BRAIN === 'codex') {
+    serveCodexSocket(socket)
+    return
+  }
 
   // Answer the HUD straight away rather than making it wait for the agent's
   // first turn. Refined later by the real init message.
@@ -1084,6 +1129,7 @@ wss.on('connection', (socket) => {
    * listener over there has already heard.
    */
   let answering = null
+  let answeringPrompt = ''
   const sendTurn = (msg) => send({ ...msg, ask: answering })
 
   /**
@@ -1261,8 +1307,8 @@ wss.on('connection', (socket) => {
       // through a `Bash: echo hello` without asking, and only reaches us for
       // something with a consequence, like a `touch`. So a deny here is
       // reliable; an absence of a call here is not proof nothing ran.
-      canUseTool: async (toolName) => {
-        const ok = decideTool(toolName)
+      canUseTool: async (toolName, input) => {
+        const ok = decideTool(toolName, input)
         console.log(`[jarvis] tool ${toolName} -> ${ok ? 'allow' : 'deny'}`)
         return ok
           ? { behavior: 'allow' }
@@ -1343,11 +1389,30 @@ wss.on('connection', (socket) => {
             // nothing to say — the HUD stops spinning and JARVIS stands there
             // silent. Say what happened instead.
             if (msg.subtype === 'success') {
-              sendTurn({
-                type: 'done',
-                text: msg.result ?? '',
-                costUsd: msg.total_cost_usd ?? null,
-              })
+              const creditError = billingError(msg.result)
+              if (creditError) {
+                console.warn('[jarvis] Claude credit unavailable; trying the local model')
+                const fallbackAsk = answering
+                try {
+                  const reply = await localAnswer(answeringPrompt)
+                  send({ type: 'text', delta: reply, ask: fallbackAsk })
+                  send({ type: 'done', text: reply, ask: fallbackAsk })
+                  console.log('[jarvis] answered with the local model')
+                } catch (fallbackError) {
+                  console.error('[jarvis] local model unavailable:', fallbackError)
+                  send({
+                    type: 'error',
+                    message: `${creditError} The local model is also unavailable.`,
+                    ask: fallbackAsk,
+                  })
+                }
+              } else {
+                sendTurn({
+                  type: 'done',
+                  text: msg.result ?? '',
+                  costUsd: msg.total_cost_usd ?? null,
+                })
+              }
             } else {
               console.error(
                 `[jarvis] turn failed: ${msg.subtype}`,
@@ -1421,6 +1486,7 @@ wss.on('connection', (socket) => {
       const id = typeof msg.id === 'string' ? msg.id : null
       void settling.then(() => {
         answering = id
+        answeringPrompt = text
         if (deliver) {
           const resolve = deliver
           deliver = null

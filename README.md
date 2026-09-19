@@ -3,37 +3,35 @@
 A browser voice assistant with an Iron Man holographic interface. Say
 **"Hey Jarvis"**, he wakes, listens, and does real things through your tools —
 searches the web, generates images, drives your phone, reads your mail. The face
-is a web page (React + Vite + Three.js + custom GLSL). The brain is Claude Code,
-run headless as a library.
+is a web page (React + Vite + Three.js + custom GLSL). The default brain is
+Codex, signed in with your ChatGPT account.
 
-**The only subscription you need is Claude Code.** No API keys, no OpenAI
-account, no cloud bill — the brain runs on your existing Claude Code login, and
-the heavy work (the model itself) runs on Anthropic's servers, so even a low-end
-laptop only has to draw the interface. **ElevenLabs is an optional add-on** that
-gives JARVIS a much better voice and sharper hearing; without it he speaks and
-listens through the browser's own speech, and everything still works.
+Codex uses the included usage in your ChatGPT plan, then any purchased ChatGPT
+Codex credits. It does not use Claude credits or an OpenAI API key. The old
+Claude bridge remains available with `JARVIS_BRAIN=claude`. **ElevenLabs is an optional add-on** that
+gives JARVIS a much better voice and sharper hearing; its Free plan includes
+10,000 monthly credits. Without it, Kokoro speaks locally and Chrome or Edge
+handles recognition, so everything still works.
 
 ---
 
 ## Requirements
 
-**In one line:** a Claude Code subscription, plus two free things every computer
+**In one line:** a ChatGPT account signed into Codex, plus two free things every computer
 can have — Node.js and Chrome. That's the whole list.
 
-- **Claude Code, installed and logged in** — this is the only account you need.
-  Install it with the official method — `npm install -g @anthropic-ai/claude-code`,
-  or the platform installer at <https://docs.claude.com/en/docs/claude-code> —
-  then run `claude` once and complete login. The bridge reuses that login. **No
-  API key**, and usage is billed to your existing Claude account.
+- **Codex CLI, installed and logged in** — run `codex login` and choose your
+  ChatGPT account. The bridge reuses that login. No OpenAI API key is needed.
 - **Node.js 20 or newer** — free, one installer from <https://nodejs.org>. This
   is a Node web app, so it is the one unavoidable tool.
 - **Google Chrome or Microsoft Edge**, in a **real browser window** — not an
   embedded preview pane. Preview panes (including the one inside editors and
-  Claude Code) block microphone access, so the page loads and looks right but
+  Codex) block microphone access, so the page loads and looks right but
   never hears you. JARVIS also needs WebGL, which these browsers provide.
 - **Optional: an ElevenLabs API key** — a good add-on, not a requirement. It
-  gives a better voice and sharper transcription; the free tier is plenty for a
-  demo. Without it, everything runs on the browser's own speech.
+  gives a better voice and sharper transcription. Create one on the
+  [ElevenLabs Free plan](https://elevenlabs.io/pricing). Without it, JARVIS uses
+  the free local/browser fallback.
 
 Run `npm run setup` after cloning and it checks all of this for you, in plain
 language.
@@ -90,27 +88,26 @@ the brain and the hands.
 ```
   ┌─ browser (the face) ───────────────┐        ┌─ bridge (the brain) ─────────────┐
   │  "Hey Jarvis" wake word            │        │  Node · bridge/server.mjs        │
-  │  local VAD  →  speech to text      │   ws   │  Claude Agent SDK                │
-  │  reactor UI (Three.js + GLSL)      │◄─────► │   = Claude Code, headless        │
-  │  text to speech                    │  8787  │  spawns your MCP servers         │
-  │  heads-up display                  │        │  permission gate (decideTool)    │
+  │  local VAD  →  speech to text      │   ws   │  Codex CLI (default)             │
+  │  reactor UI (Three.js + GLSL)      │◄─────► │  ChatGPT account usage           │
+  │  text to speech                    │  8787  │  Codex-configured tools          │
+  │  heads-up display                  │        │  local Ollama fallback           │
   └────────────────────────────────────┘        └──────────────────────────────────┘
 ```
 
 Everything you see and hear happens in the browser. The bridge is a single Node
-process (`bridge/server.mjs`) that runs the **Claude Agent SDK**
-(`@anthropic-ai/claude-agent-sdk`) — this spawns the real `claude` CLI as a child
-process, so **the brain literally is Claude Code, headless.** They talk over a
-WebSocket (plus a few HTTP endpoints) on `ws://localhost:8787`.
+process (`bridge/server.mjs`) that runs the signed-in **Codex CLI** by default.
+They talk over a WebSocket (plus a few HTTP endpoints) on `ws://localhost:8787`.
+If Codex is unavailable, general questions use the installed local Ollama model.
+Set `JARVIS_BRAIN=claude` to use the original Claude Agent SDK backend.
 
-**Why a bridge at all?** A browser tab cannot spawn the local stdio MCP servers —
-`higgsfield`, `elevenlabs`, `android`, `playwright`, `exa`, `serper`, and the
-rest. The bridge can. And because it is the Agent SDK, it authenticates off your
-existing Claude Code login: no API key, billed to that same Claude account.
+**Why a bridge at all?** A browser tab cannot launch Codex or local MCP servers.
+The bridge can, and Codex uses your ChatGPT sign-in. Tools configured only for
+Claude do not automatically appear in Codex.
 
-**The model.** `claude-opus-5` at effort `medium` by default. Override with the
-`JARVIS_MODEL` and `JARVIS_EFFORT` environment variables. On startup the bridge
-prints its choice, e.g. `[jarvis] model claude-opus-5 · effort medium`.
+**The model.** Codex uses your configured Codex default. Override it with
+`JARVIS_CODEX_MODEL`. The old Claude backend uses `JARVIS_MODEL` and
+`JARVIS_EFFORT` when selected.
 
 ### The voice pipeline
 
@@ -125,10 +122,9 @@ The loop is designed so that nothing silently dies and barge-in feels natural.
   - **ElevenLabs key present** → ElevenLabs Scribe, via the bridge `/stt` endpoint.
   - **Nothing configured** → the browser's own `SpeechRecognition` (Chrome/Edge),
     guarded by a heartbeat so it recovers when Chrome throttles it.
-- **Speaking** uses the **ElevenLabs voice when a key is present**, and the
-  browser's `speechSynthesis` otherwise. If a cloud call fails it falls back to
-  the browser voice, and if the OS voice itself is broken it latches over to the
-  cloud voice.
+- **Speaking** uses the **ElevenLabs voice when a key is present**, and local
+  Kokoro otherwise in this workspace. If generation fails, it falls back again
+  to the operating system voice so a failed service never silences a reply.
 
 So it works with no keys and auto-upgrades when a key appears — there is no flag
 to set. Capability detection lives in `src/lib/capabilities.ts`, which probes the
@@ -139,8 +135,8 @@ ElevenLabs key) once at boot and picks the engines.
 
 ## What JARVIS can do
 
-Beyond answering, JARVIS reaches every MCP server in your Claude Code
-configuration, and can drive his own interface.
+Beyond answering, Codex can use the tools in your Codex configuration.
+The following Claude tool details apply only when `JARVIS_BRAIN=claude`.
 
 ### Your tools
 
@@ -225,8 +221,10 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 | Variable | Default | Effect |
 |---|---|---|
 | `JARVIS_BRIDGE_PORT` | `8787` | Port for the WebSocket + HTTP endpoints |
-| `JARVIS_MODEL` | `claude-opus-5` | Model to run |
-| `JARVIS_EFFORT` | `medium` | Reasoning effort |
+| `JARVIS_BRAIN` | `codex` | `codex` or the original `claude` backend |
+| `JARVIS_CODEX_MODEL` | Codex default | Model for the Codex backend |
+| `JARVIS_MODEL` | `claude-opus-5` | Model for the Claude backend |
+| `JARVIS_EFFORT` | `medium` | Reasoning effort for Claude |
 | `JARVIS_ALLOW_WRITES` | off | `1` allows effectful tools (see below) |
 | `JARVIS_ALLOWED_ORIGINS` | local dev | Extra WebSocket origins to accept |
 | `JARVIS_ALLOW_NO_ORIGIN` | off | Accept connections with no `Origin` header |
@@ -247,7 +245,14 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 
 ### Adding an ElevenLabs key
 
-You do not have to touch a flag. Either:
+You do not have to touch a flag. The recommended setup is:
+
+1. Create a key at <https://elevenlabs.io/app/developers/api-keys>.
+2. Open `.env.local` and set `ELEVENLABS_API_KEY=your_key`.
+3. Restart JARVIS and reload the page.
+
+The key stays in the local bridge and is never included in browser JavaScript.
+You may instead:
 
 - Set `ELEVENLABS_API_KEY` on the bridge before starting it, **or**
 - Add the key to your `elevenlabs` MCP server's env in `~/.claude.json` — the
